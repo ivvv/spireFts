@@ -19,7 +19,7 @@ import tarfile
 from astropy.modeling import models, fitting
 from astropy.stats import median_absolute_deviation
 import copy 
-import requests
+import requests, tempfile, os, shutil
 
 # # Pointing offset corrector for SPIRE FTS sparse observations
 # 
@@ -48,37 +48,86 @@ import requests
 # The SPIRE calibration tree is usually provided as a JAR file. Reading JAR files in python is like reading zip files. 
 
 # In[7]:
-def getSpireFtsLevel2(obsid, what='spss'):
+def getSpireFtsLevel2(obsid, what='spss', archive='hsa', saveTar=True):
     """
-    Using the HTTP access to HAIO, retrieve all level-2 products in tar.gz file
-    and extract only the requested fits file
-    at then ind it puts the spectral structure in a dictionary
+    PURPOSE:
+        Using the HTTP access to HAIO, retrieve all level-2 products in a tar file
+        and extract only the requested fits file (spss in the name) at then put the data in 
+        a dictionary
+    INPUTS:
+        obsid - the OBSID of the observation
+        what - can be 'spss' for point source calibrated spectra or 'sds' for extended source 
+        calibrated data. Note that only non-apodized spectra are searched for. You can change this 
+        behaviour in the function below, by replacing '_spg_' with '_spgApod_'.
+        archive - can be 'hsa' or 'hsaint' (for the integration archive).
+        saveTar - whether to save the downloaded level-2 tar file in the current folder. The tar file name 
+            will be OBSID_level2.tar. If False, the file will be deleted after the spss FITS file is extracted.
+    OUTPUTS:
+        A nested dictionary with the following structure:
+            spec[det]['wave'], 
+            spec[det]['flux'], 
+            spec[det]['fluxErr'], 
+            where det is the name of the detector.
+        The FITS header of the primary extension of the fits file.
+    EXAMPLE:
+        spss, header = getSpireFtsLevel2(1342259588)
+        spss.keys()
+        spss["SSWD4"].keys()
+        header
+    TODO:
+        * Decide what to extract from the tar file when the observation is in H+LR mode.
+    HISTORY:
+        Created 16 Mar 2016 (IV), version 1.0
     """
+    # the name of the saved tar file.
     tarFile = "%i_level2.tar"%obsid
-    haioRequest = "http://archives.esac.esa.int/hsa/aio/jsp/product.jsp?PROTOCOL=HTTP&OBSERVATION_ID=%i&PRODUCT_LEVEL=Level2"%obsid
+    archiveUrl = "http://archives.esac.esa.int/%s/aio/jsp/product.jsp"%archive
+    haioRequest = "%s?PROTOCOL=HTTP&OBSERVATION_ID=%i&PRODUCT_LEVEL=Level2"%(archiveUrl,obsid)
     print ("Downloading level-2 data from the Herschel Science Archive. May take a while... be patient")
+    #
+    # submit the HAIO request to the server
+    #
     r = requests.get(haioRequest)
+    #
+    # save the result in a .tar file
+    #
     with open(tarFile, "wb") as tmp:
         tmp.write(r.content)
+    #
     # now read the downloaded tar file
-    with tarfile.open(tarFile,'r') as tar:
-        for member in tar.getmembers():
-            if (what in member.name and '_spg_' in member.name):
-                f=tar.extract(member)
-                xx = fits.open(member.name)
-    tar.close()
+    #
+    xx = None
+    try:
+        tar = tarfile.open(tarFile,'r')
+        for member in tar.getnames():
+            tmpdir = tempfile.mkdtemp()
+            if ((what in member) and ('_spg_' in member)):
+                f=tar.extract(member,tmpdir)
+                xx = fits.open(os.path.join(tmpdir,member))
+                break
+            # clean up the temprary folder with the extracted file
+            shutil.rmtree(tmpdir)
+            # remove the tar file if asked for.
+            if (not saveTar): os.remove(tarFile)
+    except:
+        print ("*** OBSID %i is not available or it is proprietory."%obsid)
+        return None, None
+    finally:
+        tar.close()
+    if (xx == None):
+        print ("*** OBSID %i is not an FTS sparse mode. Return."%obsid)
+        return None, None
     spec = {}
-    with xx as hdu:
-        #
-        for k in hdu:
-            extname = k.name
-            if ('S' in extname):
-                spec[k.name] = {}
-                spec[k.name]['wave'] = k.data["wave"]
-                spec[k.name]['flux'] = k.data["flux"]
-                spec[k.name]['fluxErr'] = k.data["error"]
-    return spec
-    
+    # get the primary header
+    header = xx[0].header
+    for k in xx:
+        extname = k.name
+        if ('S' in extname):
+            spec[k.name] = {}
+            spec[k.name]['wave'] = k.data["wave"]
+            spec[k.name]['flux'] = k.data["flux"]
+            spec[k.name]['fluxErr'] = k.data["error"]
+    return spec, header    
     
 # In[2]:
 def readSpireSparseSpec(spssFile):
@@ -322,7 +371,7 @@ def generateGridOffsets(jarFile,modelName="gaussian", fwhm = 1,\
 # the jar file is also available for download at 
 #     ftp://ftp.sciops.esa.int/pub/hsc-calibration/latest_cal_tree/spire_cal_14_3.jar
 # 
-jar_file = '/Users/ivaltchanov/Dropbox/Work/SPIRE/spire_cal_14_2.jar'
+jar_file = os.path.join(os.getenv('HOME'),'Dropbox/Work/SPIRE/spire_cal_14_3.jar')
 #
 # now generate the grid of offset for the model
 #
@@ -333,7 +382,7 @@ ratx, offx = generateGridOffsets(jar_file)
 #wdir = '/Users/ivaltchanov/Tmp/HerschelData/ivaltcha25093308/'
 #spss = 'hspirespectrometer1342259588_a1060001_spg_HR_20spss_1457702494491.fits.gz'
 #spec = readSpireSparseSpec(wdir + spss)
-spec = getSpireFtsLevel2(1342259588)
+spec,hhead = getSpireFtsLevel2(1342259588)
 #
 # get the initial ratio of the two bands:
 #
@@ -345,10 +394,11 @@ result = np.interp(xmed,ratx,offx)
 
 print ("Derived offset from interpolation: %f arcsec"%result)
 plt.figure(figsize=(8,5))
-plt.plot(offx, ratx, 'ko-')
-plt.plot(result,xmed,'ro')
+grid_dots, = plt.plot(offx, ratx, 'ko-')
+obs_dot, = plt.plot(result,xmed,'r*', markersize=15)
 plt.xlabel('Offset (arcsec)')
 plt.ylabel('Median jump between bands')
+plt.legend([obs_dot,grid_dots],['Observed jump',"Grid jumps"])
 # In[ ]:
 #
 # now correct with the derived offset
@@ -363,9 +413,11 @@ for idet in central:
     arr = idet[0:3]
     tmp = np.interp(spec[idet]['wave'].data,freq[arr],correc[arr])
     specCorr[idet]['flux'] = spec[idet]['flux']*tmp
-    plt.plot(spec[idet]['wave'].data, spec[idet]['flux'].data, 'r-')
-    plt.plot(specCorr[idet]['wave'], specCorr[idet]['flux'], 'g-')
+    l1, = plt.plot(spec[idet]['wave'].data, spec[idet]['flux'].data, 'r-', label='Before')
+    l2, =plt.plot(specCorr[idet]['wave'], specCorr[idet]['flux'], 'g-', label = 'After')
     pass
 #
 plt.xlabel('Frequency (GHz)')
 plt.ylabel('Flux Density (Jy)')
+plt.legend([l1,l2], ["Before","After"], loc=2)
+plt.title("Pointing correction of %s, %i, OD: %i"%(hhead["OBJECT"],hhead["OBS_ID"],hhead["ODNUMBER"]))
